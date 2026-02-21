@@ -1,0 +1,11 @@
+[package]
+name = "lora-rfm98"
+version = "0.1.0"
+edition = "2024"
+authors = ["William Thornley williamothornley@gmail.com"]
+
+[dependencies]
+embedded-hal = "1.0"
+
+[lib]
+name = "lora_rfm98"
