@@ -8,7 +8,7 @@ use embedded_hal::spi::SpiDevice;
 // Error type without heap allocation
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum RFMError {
-    InvalidVersion,
+    InvalidVersion { version: u8 },
     ModeChangeFailed { old: u8, new: u8, set: u8 },
     TransmissionTimedOut,
     Spi,
@@ -138,7 +138,7 @@ where
         // Check version
         let version = self.read_register(Register::Version)?;
         if version != 0x12 {
-            return Err(RFMError::InvalidVersion);
+            return Err(RFMError::InvalidVersion { version });
         }
 
         // Initialize chip
