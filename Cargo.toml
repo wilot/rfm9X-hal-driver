@@ -1,11 +1,22 @@
 [package]
 name = "lora-rfm98"
 version = "0.1.0"
-edition = "2024"
-authors = ["William Thornley williamothornley@gmail.com"]
+edition = "2021"
+authors = ["William Thornley <williamothornley@gmail.com>"]
 
 [dependencies]
 embedded-hal = "1.0"
 
+[dev-dependencies]
+# rppal for Raspberry Pi hardware access (only used in tests)
+rppal = { version = "0.22.1", features = ["hal"] }
+
 [lib]
 name = "lora_rfm98"
+
+# Optimization for release builds on embedded systems
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization
+strip = true        # Strip symbols
