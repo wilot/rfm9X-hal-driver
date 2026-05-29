@@ -23,6 +23,10 @@ pub enum RFMError {
 enum Register {
     FIFO = 0x00,
     OpMode = 0x01,
+    FSKBitrateMSB = 0x02,
+    FSKBitrateLSB = 0x03,
+    FSKFdevMSB = 0x04,
+    FSKFdevLSB = 0x05,
     FRFMSB = 0x06,
     FRFMID = 0x07,
     FRFLSB = 0x08,
@@ -35,10 +39,18 @@ enum Register {
     ModemConfig1 = 0x1D,
     ModemConfig2 = 0x1E,
     ModemConfig3 = 0x26,
+    FSKSyncConfig = 0x27,
+    FSKSyncValue1 = 0x28,
     PreambleLengthMSB = 0x20,
     PreambleLengthLSB = 0x21,
     SymbolTimeoutLSB = 0x1F,
+    FSKPacketConfig1 = 0x30,
+    FSKPacketConfig2 = 0x31,
+    FSKPayloadLength = 0x32,
+    FSKFifoThreshold = 0x35,
     Timer1Coefficient = 0x39,
+    FSKIRQFlags1 = 0x3E,
+    FSKIRQFlags2 = 0x3F,
     DIOMapping1 = 0x40,
     Version = 0x42,
 }
@@ -79,6 +91,33 @@ impl DataRate {
             DataRate::SF7BW125 => modem_config::SF7,
             DataRate::SF8BW125 => modem_config::SF8,
             DataRate::SF9BW125 => modem_config::SF9,
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    pub enum FskDataRate {
+        BR50kFd25k,
+        BR100kFd50k,
+        BR150kFd75k,
+    }
+
+    impl FskDataRate {
+        fn bitrate_registers(&self) -> [u8; 2] {
+            // FXOSC is 32 MHz, bitrate register = FXOSC / bitrate
+            match self {
+                FskDataRate::BR50kFd25k => [0x02, 0x80],  // 640
+                FskDataRate::BR100kFd50k => [0x01, 0x40], // 320
+                FskDataRate::BR150kFd75k => [0x00, 0xD5], // 213
+            }
+        }
+
+        fn fdev_registers(&self) -> [u8; 2] {
+            // FSTEP is 61.03515625 Hz, fdev register = fdev / FSTEP
+            match self {
+                FskDataRate::BR50kFd25k => [0x01, 0x9A],  // ~25 kHz
+                FskDataRate::BR100kFd50k => [0x03, 0x33], // ~50 kHz
+                FskDataRate::BR150kFd75k => [0x04, 0xCD], // ~75 kHz
+            }
         }
     }
 
@@ -224,6 +263,32 @@ where
         Ok(())
     }
 
+    fn set_fsk_data_rate(&mut self, data_rate: FskDataRate) -> Result<(), RFMError> {
+        let bitrate = data_rate.bitrate_registers();
+        let fdev = data_rate.fdev_registers();
+
+        self.write_register(Register::FSKBitrateMSB, bitrate[0])?;
+        self.write_register(Register::FSKBitrateLSB, bitrate[1])?;
+        self.write_register(Register::FSKFdevMSB, fdev[0])?;
+        self.write_register(Register::FSKFdevLSB, fdev[1])?;
+
+        Ok(())
+    }
+
+    fn configure_fsk_packet_engine(&mut self) -> Result<(), RFMError> {
+        // Variable packet length, CRC on.
+        self.write_register(Register::FSKPacketConfig1, 0b1001_0000)?;
+        self.write_register(Register::FSKPacketConfig2, 0x00)?;
+        self.write_register(Register::FSKPayloadLength, 0xFF)?;
+        // Tx starts when FIFO level threshold reached, threshold set to 15 bytes.
+        self.write_register(Register::FSKFifoThreshold, 0x8F)?;
+        // Enable sync word, one sync byte.
+        self.write_register(Register::FSKSyncConfig, 0x88)?;
+        // LoRa sync word 0x34 reused for interoperability in dual-mode setups.
+        self.write_register(Register::FSKSyncValue1, 0x34)?;
+        Ok(())
+    }
+
     /// Send a packet with specified frequency and data rate
     pub fn send_packet(
         &mut self,
@@ -288,9 +353,94 @@ where
         Ok(())
     }
 
+    /// Send a packet in FSK mode using variable length packets.
+    pub fn send_fsk_packet(
+        &mut self,
+        packet: &[u8],
+        frequency: [u8; 3],
+        data_rate: FskDataRate,
+    ) -> Result<(), RFMError> {
+        if packet.is_empty() || packet.len() > 255 {
+            return Err(RFMError::InvalidPacketSize);
+        }
+
+        self.set_mode(mode::STANDBY)?;
+        self.set_frequency(frequency)?;
+        self.set_fsk_data_rate(data_rate)?;
+        self.configure_fsk_packet_engine()?;
+
+        // DIO0 = PacketSent for FSK TX.
+        self.write_register(Register::DIOMapping1, 0x40)?;
+
+        // Variable packet format: first byte is payload length.
+        self.write_register(Register::FIFO, packet.len() as u8)?;
+        for &byte in packet {
+            self.write_register(Register::FIFO, byte)?;
+        }
+
+        self.set_mode(mode::TRANSMIT)?;
+
+        // Wait for PacketSent bit in RegIrqFlags2.
+        for _ in 0..100 {
+            self.delay.delay_ms(10);
+            let irq_flags_2 = self.read_register(Register::FSKIRQFlags2)?;
+            if (irq_flags_2 & 0b0000_1000) != 0 {
+                self.set_mode(mode::STANDBY)?;
+                return Ok(());
+            }
+        }
+
+        Err(RFMError::TransmissionTimedOut)
+    }
+
+    /// Enter continuous FSK receive mode using variable length packets.
+    pub fn enter_fsk_receive_mode(
+        &mut self,
+        frequency: [u8; 3],
+        data_rate: FskDataRate,
+    ) -> Result<(), RFMError> {
+        self.set_mode(mode::STANDBY)?;
+        self.set_frequency(frequency)?;
+        self.set_fsk_data_rate(data_rate)?;
+        self.configure_fsk_packet_engine()?;
+
+        // DIO0 = PayloadReady for FSK RX.
+        self.write_register(Register::DIOMapping1, 0x00)?;
+
+        self.set_mode(mode::RECEIVE_CONTINUOUS)?;
+        Ok(())
+    }
+
+    /// Return true if an FSK packet is ready in the FIFO.
+    pub fn is_fsk_packet_ready(&mut self) -> Result<bool, RFMError> {
+        let irq_flags_2 = self.read_register(Register::FSKIRQFlags2)?;
+        Ok((irq_flags_2 & 0b0000_0100) != 0)
+    }
+
+    /// Read one FSK packet from FIFO into `buffer`.
+    pub fn read_fsk_packet(&mut self, buffer: &mut [u8]) -> Result<usize, RFMError> {
+        let payload_length = self.read_register(Register::FIFO)? as usize;
+        if payload_length == 0 || payload_length > buffer.len() {
+            return Err(RFMError::InvalidPacketSize);
+        }
+
+        for byte in buffer.iter_mut().take(payload_length) {
+            *byte = self.read_register(Register::FIFO)?;
+        }
+        Ok(payload_length)
+    }
+
     /// Check if DIO0 pin is high (indicates RxDone or TxDone)
     pub fn is_dio0_high(&mut self) -> Result<bool, RFMError> {
         self.dio0.is_high().map_err(|_| RFMError::Gpio)
+    }
+
+    /// Return raw FSK IRQ flags for diagnostics.
+    pub fn read_fsk_irq_flags(&mut self) -> Result<(u8, u8), RFMError> {
+        Ok((
+            self.read_register(Register::FSKIRQFlags1)?,
+            self.read_register(Register::FSKIRQFlags2)?,
+        ))
     }
 }
 
